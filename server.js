@@ -16,6 +16,10 @@ app.use(express.json());
 const PORT = parseInt(process.env.PORT || '3001', 10);
 const SPREADSHEET_ID = process.env.SPREADSHEET_ID;
 const SERVICE_ACCOUNT_FILE = process.env.GOOGLE_SERVICE_ACCOUNT || 'service_account.json';
+const TARGET_CRYPTO_SYMBOLS = (process.env.TARGET_CRYPTO_SYMBOLS || 'BTC').split(',').map(s => s.trim().toUpperCase()).filter(Boolean);
+const TARGET_CRYPTO_PCT = parseFloat(process.env.TARGET_CRYPTO_PCT || '30');
+const TARGET_STOCK_TOTAL_PCT = parseFloat(process.env.TARGET_STOCK_TOTAL_PCT || '70');
+const TARGET_STOCK_COUNT = parseInt(process.env.TARGET_STOCK_COUNT || '7', 10);
 
 if (!SPREADSHEET_ID) {
     throw new Error('Missing SPREADSHEET_ID in environment variables.');
@@ -25,6 +29,13 @@ const auth = new google.auth.GoogleAuth({
     keyFile: SERVICE_ACCOUNT_FILE,
     scopes: ['https://www.googleapis.com/auth/spreadsheets.readonly'],
 });
+
+const CRYPTO_SYMBOLS = ['BTC', 'ETH', 'SOL'];
+
+const isCryptoSymbol = (symbol = '') => {
+    const s = symbol.trim().toUpperCase();
+    return CRYPTO_SYMBOLS.includes(s) || s.endsWith('-USD');
+};
 
 // Helper: ล้าง String ให้เป็นตัวเลข
 const cleanNum = (val) => {
@@ -36,20 +47,76 @@ const cleanNum = (val) => {
 async function getPortfolioSummary() {
     const client = await auth.getClient();
     const gs = google.sheets({ version: 'v4', auth: client });
-    const res = await gs.spreadsheets.values.get({ spreadsheetId: SPREADSHEET_ID, range: 'Portfolio_Summary!A2:H' });
+    const res = await gs.spreadsheets.values.get({ spreadsheetId: SPREADSHEET_ID, range: 'Portfolio_Summary!A1:Z' });
     const rows = res.data.values;
     if (!rows) return [];
 
-    return rows.map(r => {
+    const headers = rows[0] || [];
+    const dataRows = rows.slice(1);
+    const targetAllocMap = await getTargetAllocationMap();
+
+    const findHeaderIndex = (patterns, fallbackIndex) => {
+        const idx = headers.findIndex(h => {
+            const header = String(h || '').toLowerCase();
+            return patterns.some(p => header.includes(p));
+        });
+        return { index: idx >= 0 ? idx : fallbackIndex, found: idx >= 0 };
+    };
+
+    const avgCostInfo = findHeaderIndex(['avg cost', 'average cost', 'avg_cost', 'average_cost'], 4);
+    const qtyInfo = findHeaderIndex(['total_qty', 'qty', 'quantity', 'total qty'], 2);
+    const currentAllocInfo = findHeaderIndex(['current', 'current alloc', 'current allocation', 'current_alloc'], 6);
+    const targetAllocInfo = findHeaderIndex(['target', 'target alloc', 'target allocation', 'target_alloc'], 7);
+    const totalSpentInfo = findHeaderIndex(['total spent', 'total_spent', 'total_spent_usd', 'spent'], 3);
+    const totalSpent = dataRows.reduce((sum, r) => sum + cleanNum(r[totalSpentInfo.index]), 0);
+
+    console.log(`[Header] avg_cost=${avgCostInfo.index} | qty=${qtyInfo.index} | current_alloc=${currentAllocInfo.index} | target_alloc=${targetAllocInfo.index} | total_spent=${totalSpentInfo.index} | target_map=${Object.keys(targetAllocMap).length}`);
+    console.log(`[Header Row] ${headers.map(h => String(h || '').trim()).join(' | ')}`);
+    if (dataRows.length) {
+        console.log(`[Sample Row] ${dataRows[0].map(v => String(v || '').trim()).join(' | ')}`);
+    }
+
+    return dataRows.map(r => {
         const symbol = r[0];
+        const type = String(r[1] || '').trim().toUpperCase();
         // 🔴 แก้ไข Index ตรงนี้ให้ตรงกับไฟล์ CSV
-        const avg_cost = cleanNum(r[4]);      // คอลัมน์ E (Index 4) คือ Average Cost
-        const current_alloc = cleanNum(r[6]) / 100; // คอลัมน์ G (Index 6)
-        const target_alloc = cleanNum(r[7]) / 100;  // คอลัมน์ H (Index 7)
+        const avg_cost = cleanNum(r[avgCostInfo.index]);      // Average Cost
+        const qty = cleanNum(r[qtyInfo.index]);               // Total Quantity
+
+        const hasCurrentAlloc = currentAllocInfo.found && r[currentAllocInfo.index] != null && String(r[currentAllocInfo.index]).trim() !== '';
+        let current_alloc = hasCurrentAlloc ? cleanNum(r[currentAllocInfo.index]) / 100 : null; // Current Allocation
+        const spentValue = cleanNum(r[totalSpentInfo.index]);
+        if (current_alloc == null && totalSpent > 0 && spentValue > 0) {
+            current_alloc = spentValue / totalSpent;
+        }
+        if (current_alloc == null) current_alloc = 0;
+
+        const hasTargetAlloc = targetAllocInfo.found && r[targetAllocInfo.index] != null && String(r[targetAllocInfo.index]).trim() !== '';
+        let target_alloc = hasTargetAlloc ? cleanNum(r[targetAllocInfo.index]) / 100 : null;  // Target Allocation
+        const symbolKey = String(symbol || '').trim().toUpperCase();
+        if (target_alloc == null && targetAllocMap[symbolKey] != null) {
+            target_alloc = targetAllocMap[symbolKey];
+        }
+        if (target_alloc == null) {
+            if (TARGET_CRYPTO_SYMBOLS.includes(symbolKey) || type === 'CRYPTO') {
+                target_alloc = TARGET_CRYPTO_PCT / 100;
+            } else if (type === 'STOCK' || type === 'EQUITY' || type === 'US_STOCK') {
+                target_alloc = TARGET_STOCK_COUNT > 0 ? (TARGET_STOCK_TOTAL_PCT / TARGET_STOCK_COUNT) / 100 : 0;
+            } else {
+                target_alloc = 0;
+            }
+        }
 
         console.log(`[Data] ${symbol} | Real AvgCost: ${avg_cost} | Target: ${target_alloc*100}%`);
 
-        return { symbol, avg_cost, current_alloc, target_alloc };
+        const gap = ((target_alloc - current_alloc) * 100).toFixed(2);
+        console.log(`-----------------------------------`);
+        console.log(`📊 Asset: ${symbol}`);
+        console.log(`   └─ Current (Spent): ${(current_alloc * 100).toFixed(2)}%`);
+        console.log(`   └─ Target:  ${(target_alloc * 100).toFixed(2)}%`);
+        console.log(`   └─ Gap:     ${gap}% ${gap > 5 ? '🔥 (Bonus Score Active)' : ''}`);
+
+        return { symbol, avg_cost, current_alloc, target_alloc, qty };
     }).filter(i => i.symbol);
 }
 
@@ -60,6 +127,65 @@ async function getRemainingBudget() {
     const rows = res.data.values;
     if (!rows || rows.length === 0) return 300;
     return cleanNum(rows[rows.length - 1][3]); // คอลัมน์ D: Remaining
+}
+
+async function getTargetAllocationMap() {
+    try {
+        const client = await auth.getClient();
+        const gs = google.sheets({ version: 'v4', auth: client });
+        const res = await gs.spreadsheets.values.get({ spreadsheetId: SPREADSHEET_ID, range: 'Target_Allocation!A1:C' });
+        const rows = res.data.values;
+        if (!rows || rows.length < 2) return {};
+
+        const headers = rows[0] || [];
+        const symbolIdx = headers.findIndex(h => {
+            const header = String(h || '').toLowerCase();
+            return header.includes('asset') || header.includes('symbol');
+        });
+        const targetIdx = headers.findIndex(h => String(h || '').toLowerCase().includes('target'));
+        if (symbolIdx < 0 || targetIdx < 0) return {};
+
+        const map = {};
+        rows.slice(1).forEach(r => {
+            const symbol = String(r[symbolIdx] || '').trim().toUpperCase();
+            if (!symbol) return;
+            let target = cleanNum(r[targetIdx]);
+            if (target > 1) target = target / 100;
+            map[symbol] = target;
+        });
+        return map;
+    } catch (e) {
+        return {};
+    }
+}
+
+async function getCryptoFearGreed() {
+    try {
+        const fngRes = await axios.get('https://api.alternative.me/fng/');
+        return parseInt(fngRes.data.data[0].value);
+    } catch (e) {
+        return 50;
+    }
+}
+
+async function getUsMarketFearGreed() {
+    try {
+        const vixHistory = await yahooFinance.historical('^VIX', {
+            period1: new Date(new Date().setDate(new Date().getDate() - 365)),
+            period2: new Date(),
+            interval: '1d'
+        });
+        const closes = vixHistory.map(c => c.close).filter(v => v != null);
+        if (!closes.length) return 50;
+        const current = closes[closes.length - 1];
+        const sorted = [...closes].sort((a, b) => a - b);
+        const rank = sorted.findIndex(v => v >= current);
+        const percentile = rank >= 0 ? (rank / (sorted.length - 1)) : 0.5;
+        const fng = Math.round((1 - percentile) * 100);
+        return Math.max(0, Math.min(100, fng));
+    } catch (e) {
+        return 50;
+    }
 }
 
 async function getMarketInfo(symbol, options = {}) {
@@ -180,29 +306,31 @@ function computeDecision({ price, closes, avg_cost, current_alloc, target_alloc,
     };
 }
 
-function median(values) {
-    if (!values.length) return 0;
-    const sorted = [...values].sort((a, b) => a - b);
-    const mid = Math.floor(sorted.length / 2);
-    return sorted.length % 2 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2;
-}
-
-async function analyze(asset, budget, fng) {
-    const { symbol, avg_cost, current_alloc, target_alloc } = asset;
-    const { price, closes, history } = await getMarketInfo(symbol);
+async function analyze(asset, budget, fng, marketInfo = null, currentAllocOverride = null) {
+    const { symbol, avg_cost, current_alloc, target_alloc, qty } = asset;
+    const { price, closes, history } = marketInfo || await getMarketInfo(symbol);
 
     if (price === 0 || closes.length < 200) return { symbol, status: "Insufficient Data" };
 
-    const decision = computeDecision({ price, closes, avg_cost, current_alloc, target_alloc, fng, budget, history });
+    const effectiveCurrentAlloc = currentAllocOverride != null ? currentAllocOverride : current_alloc;
+    const decision = computeDecision({ price, closes, avg_cost, current_alloc: effectiveCurrentAlloc, target_alloc, fng, budget, history });
     if (decision.status === "Insufficient Data") return { symbol, status: "Insufficient Data" };
+
+    const allocation_current_pct = Math.round(effectiveCurrentAlloc * 10000) / 100;
+    const allocation_target_pct = Math.round(target_alloc * 10000) / 100;
+    const allocation_gap_pct = Math.round((allocation_target_pct - allocation_current_pct) * 100) / 100;
 
     return {
         symbol,
         price,
+        qty,
+        market_value: Math.round((price * (qty || 0)) * 100) / 100,
         score: decision.score,
         action: decision.action,
-        recommend_usd: decision.recommend_usd,
         reasons: decision.reasons,
+        allocation_current_pct,
+        allocation_target_pct,
+        allocation_gap_pct,
         avg_cost_available: decision.avg_cost_available,
         avg_cost_diff_abs: decision.avg_cost_diff_abs,
         avg_cost_diff_pct: decision.avg_cost_diff_pct,
@@ -217,79 +345,41 @@ async function analyze(asset, budget, fng) {
     };
 }
 
-async function backtestSymbol(asset, fng, lookaheadDays, days) {
-    const { symbol, avg_cost, current_alloc, target_alloc } = asset;
-    const { history } = await getMarketInfo(symbol, { days, includeQuote: false });
-    if (!history || history.length < 220) {
-        return { symbol, signals: 0, hit_rate: 0, avg_return_pct: 0, median_return_pct: 0 };
-    }
-
-    const returns = [];
-    for (let i = 200; i < history.length - lookaheadDays; i++) {
-        const slice = history.slice(0, i + 1);
-        const closes = slice.map(c => c.close).filter(v => v != null);
-        const price = history[i].close;
-        if (!price || closes.length < 200) continue;
-
-        const decision = computeDecision({ price, closes, avg_cost, current_alloc, target_alloc, fng, budget: 0 });
-        if (decision.status === "Insufficient Data") continue;
-        if (decision.action === "WAIT") continue;
-
-        const future = history[i + lookaheadDays]?.close;
-        if (!future) continue;
-        const ret = (future - price) / price;
-        returns.push(ret);
-    }
-
-    const signals = returns.length;
-    const hitRate = signals ? (returns.filter(r => r > 0).length / signals) : 0;
-    const avgReturn = signals ? (returns.reduce((a, b) => a + b, 0) / signals) : 0;
-    const medReturn = median(returns);
-
-    return {
-        symbol,
-        signals,
-        hit_rate: Math.round(hitRate * 1000) / 10,
-        avg_return_pct: Math.round(avgReturn * 1000) / 10,
-        median_return_pct: Math.round(medReturn * 1000) / 10
-    };
-}
-
 app.get('/analyze', async (req, res) => {
     try {
-        const [portfolio, budget, fngRes] = await Promise.all([
-            getPortfolioSummary(), getRemainingBudget(), axios.get('https://api.alternative.me/fng/')
+        const [portfolio, budget] = await Promise.all([
+            getPortfolioSummary(), getRemainingBudget()
         ]);
-        const fng = parseInt(fngRes.data.data[0].value);
-        const results = await Promise.all(portfolio.map(a => analyze(a, budget, fng)));
-        res.json({ budget_remaining: budget, fear_greed: fng, analysis: results });
-    } catch (e) { res.status(500).json({ error: e.message }); }
-});
-
-app.get('/backtest', async (req, res) => {
-    try {
-        const lookahead = parseInt(req.query.lookahead || '20');
-        const days = parseInt(req.query.days || '720');
-        const [portfolio, fngRes] = await Promise.all([
-            getPortfolioSummary(), axios.get('https://api.alternative.me/fng/')
+        const [cryptoFng, usFng] = await Promise.all([
+            getCryptoFearGreed(), getUsMarketFearGreed()
         ]);
-        const fng = parseInt(fngRes.data.data[0].value);
-        const results = await Promise.all(portfolio.map(a => backtestSymbol(a, fng, lookahead, days)));
-
-        const allSignals = results.reduce((sum, r) => sum + r.signals, 0);
-        const avgHitRate = results.length ? (results.reduce((sum, r) => sum + r.hit_rate, 0) / results.length) : 0;
-        const avgReturn = results.length ? (results.reduce((sum, r) => sum + r.avg_return_pct, 0) / results.length) : 0;
-        const avgMedian = results.length ? (results.reduce((sum, r) => sum + r.median_return_pct, 0) / results.length) : 0;
-
+        const marketInfos = await Promise.all(portfolio.map(a => getMarketInfo(a.symbol)));
+        const marketValues = marketInfos.map((m, i) => (m.price || 0) * (portfolio[i].qty || 0));
+        const totalMarketValue = marketValues.reduce((sum, v) => sum + v, 0);
+        marketValues.forEach((val, i) => {
+            const symbol = portfolio[i].symbol;
+            const price = marketInfos[i].price || 0;
+            const qty = portfolio[i].qty || 0;
+            console.log(`💹 Valuation ${symbol}: price=${price} qty=${qty} value=${Math.round(val * 100) / 100}`);
+        });
+        console.log(`💹 Total Market Value: ${Math.round(totalMarketValue * 100) / 100}`);
+        marketValues.forEach((val, i) => {
+            const symbol = portfolio[i].symbol;
+            const targetAlloc = portfolio[i].target_alloc || 0;
+            const currentAllocByValue = totalMarketValue > 0 ? (val / totalMarketValue) : 0;
+            const gap = ((targetAlloc - currentAllocByValue) * 100).toFixed(2);
+            console.log(`📈 Allocation ${symbol}: current=${(currentAllocByValue * 100).toFixed(2)}% target=${(targetAlloc * 100).toFixed(2)}% gap=${gap}%`);
+        });
+        const results = await Promise.all(portfolio.map((a, i) => {
+            const currentAllocByValue = totalMarketValue > 0 ? (marketValues[i] / totalMarketValue) : a.current_alloc;
+            const fng = isCryptoSymbol(a.symbol) ? cryptoFng : usFng;
+            return analyze(a, budget, fng, marketInfos[i], currentAllocByValue);
+        }));
         res.json({
-            lookahead_days: lookahead,
-            history_days: days,
-            fear_greed: fng,
-            total_signals: allSignals,
-            avg_hit_rate_pct: Math.round(avgHitRate * 10) / 10,
-            avg_return_pct: Math.round(avgReturn * 10) / 10,
-            avg_median_return_pct: Math.round(avgMedian * 10) / 10,
-            per_symbol: results
+            budget_remaining: budget,
+            fear_greed_crypto: cryptoFng,
+            fear_greed_us: usFng,
+            analysis: results
         });
     } catch (e) { res.status(500).json({ error: e.message }); }
 });
