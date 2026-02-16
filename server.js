@@ -53,7 +53,6 @@ async function getPortfolioSummary() {
 
     const headers = rows[0] || [];
     const dataRows = rows.slice(1);
-    const targetAllocMap = await getTargetAllocationMap();
 
     const findHeaderIndex = (patterns, fallbackIndex) => {
         const idx = headers.findIndex(h => {
@@ -65,12 +64,10 @@ async function getPortfolioSummary() {
 
     const avgCostInfo = findHeaderIndex(['avg cost', 'average cost', 'avg_cost', 'average_cost'], 4);
     const qtyInfo = findHeaderIndex(['total_qty', 'qty', 'quantity', 'total qty'], 2);
-    const currentAllocInfo = findHeaderIndex(['current', 'current alloc', 'current allocation', 'current_alloc'], 6);
-    const targetAllocInfo = findHeaderIndex(['target', 'target alloc', 'target allocation', 'target_alloc'], 7);
     const totalSpentInfo = findHeaderIndex(['total spent', 'total_spent', 'total_spent_usd', 'spent'], 3);
     const totalSpent = dataRows.reduce((sum, r) => sum + cleanNum(r[totalSpentInfo.index]), 0);
 
-    console.log(`[Header] avg_cost=${avgCostInfo.index} | qty=${qtyInfo.index} | current_alloc=${currentAllocInfo.index} | target_alloc=${targetAllocInfo.index} | total_spent=${totalSpentInfo.index} | target_map=${Object.keys(targetAllocMap).length}`);
+    console.log(`[Header] avg_cost=${avgCostInfo.index} | qty=${qtyInfo.index} | total_spent=${totalSpentInfo.index}`);
     console.log(`[Header Row] ${headers.map(h => String(h || '').trim()).join(' | ')}`);
     if (dataRows.length) {
         console.log(`[Sample Row] ${dataRows[0].map(v => String(v || '').trim()).join(' | ')}`);
@@ -83,28 +80,17 @@ async function getPortfolioSummary() {
         const avg_cost = cleanNum(r[avgCostInfo.index]);      // Average Cost
         const qty = cleanNum(r[qtyInfo.index]);               // Total Quantity
 
-        const hasCurrentAlloc = currentAllocInfo.found && r[currentAllocInfo.index] != null && String(r[currentAllocInfo.index]).trim() !== '';
-        let current_alloc = hasCurrentAlloc ? cleanNum(r[currentAllocInfo.index]) / 100 : null; // Current Allocation
         const spentValue = cleanNum(r[totalSpentInfo.index]);
-        if (current_alloc == null && totalSpent > 0 && spentValue > 0) {
-            current_alloc = spentValue / totalSpent;
-        }
-        if (current_alloc == null) current_alloc = 0;
+        const current_alloc = totalSpent > 0 && spentValue > 0 ? (spentValue / totalSpent) : 0;
 
-        const hasTargetAlloc = targetAllocInfo.found && r[targetAllocInfo.index] != null && String(r[targetAllocInfo.index]).trim() !== '';
-        let target_alloc = hasTargetAlloc ? cleanNum(r[targetAllocInfo.index]) / 100 : null;  // Target Allocation
         const symbolKey = String(symbol || '').trim().toUpperCase();
-        if (target_alloc == null && targetAllocMap[symbolKey] != null) {
-            target_alloc = targetAllocMap[symbolKey];
-        }
-        if (target_alloc == null) {
-            if (TARGET_CRYPTO_SYMBOLS.includes(symbolKey) || type === 'CRYPTO') {
-                target_alloc = TARGET_CRYPTO_PCT / 100;
-            } else if (type === 'STOCK' || type === 'EQUITY' || type === 'US_STOCK') {
-                target_alloc = TARGET_STOCK_COUNT > 0 ? (TARGET_STOCK_TOTAL_PCT / TARGET_STOCK_COUNT) / 100 : 0;
-            } else {
-                target_alloc = 0;
-            }
+        let target_alloc;
+        if (TARGET_CRYPTO_SYMBOLS.includes(symbolKey) || type === 'CRYPTO') {
+            target_alloc = TARGET_CRYPTO_PCT / 100;
+        } else if (type === 'STOCK' || type === 'EQUITY' || type === 'US_STOCK') {
+            target_alloc = TARGET_STOCK_COUNT > 0 ? (TARGET_STOCK_TOTAL_PCT / TARGET_STOCK_COUNT) / 100 : 0;
+        } else {
+            target_alloc = 0;
         }
 
         console.log(`[Data] ${symbol} | Real AvgCost: ${avg_cost} | Target: ${target_alloc*100}%`);
@@ -127,36 +113,6 @@ async function getRemainingBudget() {
     const rows = res.data.values;
     if (!rows || rows.length === 0) return 300;
     return cleanNum(rows[rows.length - 1][3]); // คอลัมน์ D: Remaining
-}
-
-async function getTargetAllocationMap() {
-    try {
-        const client = await auth.getClient();
-        const gs = google.sheets({ version: 'v4', auth: client });
-        const res = await gs.spreadsheets.values.get({ spreadsheetId: SPREADSHEET_ID, range: 'Target_Allocation!A1:C' });
-        const rows = res.data.values;
-        if (!rows || rows.length < 2) return {};
-
-        const headers = rows[0] || [];
-        const symbolIdx = headers.findIndex(h => {
-            const header = String(h || '').toLowerCase();
-            return header.includes('asset') || header.includes('symbol');
-        });
-        const targetIdx = headers.findIndex(h => String(h || '').toLowerCase().includes('target'));
-        if (symbolIdx < 0 || targetIdx < 0) return {};
-
-        const map = {};
-        rows.slice(1).forEach(r => {
-            const symbol = String(r[symbolIdx] || '').trim().toUpperCase();
-            if (!symbol) return;
-            let target = cleanNum(r[targetIdx]);
-            if (target > 1) target = target / 100;
-            map[symbol] = target;
-        });
-        return map;
-    } catch (e) {
-        return {};
-    }
 }
 
 async function getCryptoFearGreed() {
